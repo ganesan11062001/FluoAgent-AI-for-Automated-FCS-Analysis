@@ -1,6 +1,6 @@
 # FCS/FCCS Analysis App
 
-**Live app:** https://fcsanalysis-2numjr9tkkzc2jyqmtq6lz.streamlit.app/
+**Live app:** https://makowski-lab-fcs-analysis.streamlit.app/
 
 A local, cross-platform (macOS Apple Silicon-native) tool for analyzing Fluorescence
 Correlation/Cross-Correlation Spectroscopy (FCS/FCCS) traces exported from an ISS
