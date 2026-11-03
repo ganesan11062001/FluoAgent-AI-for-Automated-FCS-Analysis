@@ -17,7 +17,8 @@ from app_common import (
     SERIES_COLORS,
 )
 
-from core.fitting import multi_start_fit
+from core.correlate import PLATEAU_TAU_S, plateau_level, smooth_error
+from core.fitting import multi_start_fit, QUALITY_GOOD, QUALITY_ROUGH, QUALITY_UNRESOLVED, TAUD_EDGE_FACTOR, format_rel_err
 from core.fccs import bound_fraction_from_cross, amplitude_at_zero
 from core.export import (
     correlation_results_to_df,
@@ -29,6 +30,9 @@ from core.export import (
     df_to_csv_bytes,
 )
 
+# Above this raw sampling interval, sub-millisecond decays are poorly sampled.
+SLOW_SAMPLING_DT_S = 20e-6
+
 st.set_page_config(page_title="Single File Analysis", layout="wide")
 init_defaults()
 sidebar_about()
@@ -36,9 +40,9 @@ d = st.session_state["defaults"]
 
 st.title("Single File Analysis")
 st.caption(
-    "Upload a trace, tell the app how long a window to correlate, and it automatically "
-    "slides that window across the whole acquisition to find the cleanest stretch -- no "
-    "manual trimming required."
+    "Upload a trace and pick a window length. The app splits the acquisition into "
+    "windows of that length, screens out outlier windows (bleaching, drift, aggregates), "
+    "and averages the rest. No manual trimming required."
 )
 
 uploaded = st.file_uploader("VistaVision trace export (single- or dual-channel CSV)", type=["csv"])
@@ -54,6 +58,14 @@ info_cols[1].metric("Rows", f"{trace.n_rows:,}")
 info_cols[2].metric("Raw dt", format_seconds(trace.dt))
 info_cols[3].metric("Raw sampling rate", f"{1.0 / trace.dt:,.0f} Hz")
 
+if trace.dt > SLOW_SAMPLING_DT_S:
+    st.warning(
+        f"Sampled at {1.0 / trace.dt:,.0f} Hz, so the first lag is {format_seconds(trace.dt)}. "
+        f"Diffusion times shorter than about {format_seconds(TAUD_EDGE_FACTOR * trace.dt)} can't be "
+        "resolved from this file -- the decay happens before the first lag. If you expect "
+        "sub-millisecond diffusion times, use a recording at a higher sampling rate."
+    )
+
 if trace.used_fallback_parser:
     st.warning(f"Fast parser was bypassed for this file: {trace.fallback_reason}")
 
@@ -66,12 +78,12 @@ window_length_s = st.selectbox(
     index=default_window_length_idx,
     key="sf_window_length_s",
     help=(
-        "The app slides a window of this length across the whole trace in 1-second steps "
-        "(0-L, 1-(1+L), 2-(2+L), ... to the end) and automatically keeps the step with the "
-        "cleanest correlation curve. Pick a period comparable to how long you'd expect the "
-        "signal to stay stable -- shorter periods give more candidates to choose from but "
-        "each has less data (noisier); longer periods have less noise per window but fewer "
-        "candidates to pick from."
+        "The trace is split into non-overlapping windows of this length (0-L, L-2L, ...). "
+        "Outlier windows are rejected and the rest are averaged into one curve, with error "
+        "bars from the spread across windows. Shorter windows give more windows (better error "
+        "bars, finer outlier rejection) but each must still be much longer than the slowest "
+        "decay you want to resolve. Overlapping 1-second-step windows are also computed so "
+        "you can inspect or pick a single stretch by hand."
     ),
 )
 
@@ -122,12 +134,12 @@ with st.expander("Advanced settings (defaults match VistaVision manual sec. 13.4
         ),
     )
     n_blocks = c5.number_input(
-        "Sub-blocks for error estimate / window scoring", min_value=2, max_value=50, value=5, key="sf_n_blocks",
+        "Sub-blocks for single-window error bars", min_value=2, max_value=50, value=5, key="sf_n_blocks",
         help=(
-            "Used two ways: (1) the per-point error bars on the final curve, and (2) scoring "
-            "each candidate time window during the automatic search below (higher "
-            "signal-to-noise = cleaner window). More sub-blocks = a more stable error estimate "
-            "but needs a longer trace per candidate window."
+            "Only used when a single window or the full trace is selected: its error bars "
+            "come from splitting it into this many sub-blocks. The averaged curve's error bars "
+            "come from the spread across windows instead. More sub-blocks = a more stable "
+            "error estimate but each sub-block is shorter."
         ),
     )
     wcol1, wcol2 = st.columns(2)
@@ -158,24 +170,27 @@ run_id = (
 auto = run_auto_window_search_cached(
     uploaded.getvalue(), uploaded.name, window_length_s, segments, points_per_segment, base, bin_points, n_blocks
 )
-best = auto.chosen
 valid_candidates = [c for c in auto.candidates if not c.failed]
-if not valid_candidates:
+if not valid_candidates and auto.full_trace is None:
     st.error(
-        "Every candidate window was too short to score (not enough data for the configured "
-        "number of sub-blocks). Try a shorter window length or fewer sub-blocks in Advanced settings."
+        "The trace couldn't be correlated with these settings. Try fewer segments or "
+        "points per segment in Advanced settings."
     )
     st.stop()
 
 
 def _option_label(c):
-    tag = " -- auto-picked" if c.label == best.label else ""
-    return f"{c.label} (SNR {c.score:.3g}){tag}"
+    if c.kind == "average":
+        return f"{c.label} (recommended)"
+    if c.kind == "full":
+        return c.label
+    return f"{c.label} -- outlier: {c.reject_reason}" if c.rejected else c.label
 
 
-option_labels = [_option_label(c) for c in valid_candidates]
-label_lookup = dict(zip(option_labels, valid_candidates))
-default_option = _option_label(best)
+selectable = [c for c in (auto.average, auto.full_trace) if c is not None] + valid_candidates
+option_labels = [_option_label(c) for c in selectable]
+label_lookup = dict(zip(option_labels, selectable))
+default_option = _option_label(auto.chosen)
 
 if st.session_state.get("sf_run_id") != run_id:
     st.session_state["sf_run_id"] = run_id
@@ -184,57 +199,88 @@ if st.session_state.get("sf_run_id") != run_id:
     st.session_state["sf_fit_window_acf_ch1"] = default_option
     st.session_state["sf_fit_window_acf_ch2"] = default_option
 
+tiled_ok = [w for w in auto.tiled if not w.failed]
+tiled_rejected = [w for w in tiled_ok if w.rejected]
+channel_names = list(trace.channels.keys())
+
 with st.container(border=True):
     st.subheader("1. Time window")
     selected_option = st.selectbox(
-        "Window to use",
+        "Curve to use",
         options=option_labels,
         key="sf_window_choice",
         help=(
-            "Defaults to the auto-picked window (highest correlation-curve signal-to-noise "
-            "ratio among all candidates from the sliding search). Pick any other candidate "
-            "to use it instead -- the curve, fit, and exports below all update to match "
-            "whichever window is selected here."
+            "Defaults to the average of all non-outlier windows. You can also use the full "
+            "trace as one curve, or any single sliding window. The curve, fit, and exports "
+            "below all follow this choice."
         ),
     )
     chosen = label_lookup[selected_option]
-    st.plotly_chart(plot_raw_trace_with_window(trace.time, trace.channels, chosen.t0, chosen.t1), width="stretch")
-    st.caption(
-        f"Slid a {window_length_s}s window across the trace in 1s steps and evaluated "
-        f"{len(auto.candidates)} candidates (t = {format_seconds(chosen.t0)} to {format_seconds(chosen.t1)} "
-        f"currently selected)."
-    )
-    with st.expander(f"All {len(auto.candidates)} candidates"):
-        cand_df = pd.DataFrame(
-            [
-                {
-                    "window": c.label,
-                    "t0 (s)": c.t0,
-                    "t1 (s)": c.t1,
-                    "SNR score": c.score if not c.failed else None,
-                    "auto-picked": c.label == best.label,
-                    "currently selected": c.label == chosen.label,
-                    "skipped": c.failed,
-                }
-                for c in auto.candidates
-            ]
+    if chosen.kind == "average":
+        kept = [(w.t0, w.t1) for w in tiled_ok if not w.rejected]
+        st.plotly_chart(
+            plot_raw_trace_with_window(
+                trace.time, trace.channels, chosen.t0, chosen.t1,
+                kept_spans=kept, rejected_spans=[(w.t0, w.t1) for w in tiled_rejected],
+            ),
+            width="stretch",
         )
-        st.dataframe(cand_df, width="stretch", hide_index=True)
+    else:
+        st.plotly_chart(plot_raw_trace_with_window(trace.time, trace.channels, chosen.t0, chosen.t1), width="stretch")
+
+    if auto.average is not None:
         st.caption(
-            "SNR score = median |G(tau)| / standard-error(tau) across the curve (higher = cleaner). "
-            "A window is skipped if it's too short to split into the configured number of "
-            "sub-blocks. See the Methodology page for the exact formula."
+            f"Split the trace into {len(tiled_ok)} non-overlapping {window_length_s}s windows; "
+            f"{len(tiled_rejected)} rejected as outliers, {auto.average.n_averaged} averaged."
+        )
+        if auto.average.n_averaged < 5:
+            st.warning(
+                f"Only {auto.average.n_averaged} windows went into the average, so its error bars "
+                "are rough. A shorter window length gives more windows."
+            )
+        if tiled_ok and len(tiled_rejected) / len(tiled_ok) > 1 / 3:
+            st.warning(
+                f"{len(tiled_rejected)} of {len(tiled_ok)} windows were rejected. The trace may be "
+                "unstable (bleaching, drift, or frequent aggregates). Check the raw trace above."
+            )
+    else:
+        st.info(
+            "Fewer than 2 usable windows of this length fit in the trace, so there's no average. "
+            "Using the full trace as a single curve instead. Pick a shorter window length to "
+            "enable averaging."
         )
 
-    with st.expander(f"View all {len(valid_candidates)} candidate curves"):
-        st.caption("Click \"Use this window\" under any plot to switch the selection above to it.")
+    with st.expander(f"Outlier screening ({len(tiled_ok)} windows)"):
+        screen_rows = []
+        for w in tiled_ok:
+            row = {"window": w.label, "t0 (s)": w.t0, "t1 (s)": w.t1}
+            for name, rate in zip(channel_names, w.mean_rates):
+                row[f"{name} rate (Hz)"] = rate
+            for kind, amp in w.amplitudes.items():
+                row[f"{kind} amplitude"] = amp
+            row["in average"] = auto.average is not None and not w.rejected
+            row["rejected because"] = w.reject_reason
+            screen_rows.append(row)
+        st.dataframe(pd.DataFrame(screen_rows), width="stretch", hide_index=True)
+        st.caption(
+            "A window is rejected if its mean count rate (any channel) or its correlation "
+            "amplitude (mean G over the first 5 lags, any curve) is more than 3.5 robust "
+            "standard deviations (1.4826 x MAD) from the median across windows. See the "
+            "Methodology page for details."
+        )
+
+    with st.expander(f"View all {len(valid_candidates)} sliding-window curves"):
+        st.caption(
+            "Overlapping windows in 1 s steps, for inspection. Click \"Use this window\" under "
+            "any plot to analyze just that stretch."
+        )
         grid_cols = st.columns(3)
         for i, c in enumerate(valid_candidates):
             with grid_cols[i % 3]:
                 with st.container(border=True):
                     tags = []
-                    if c.label == best.label:
-                        tags.append("auto-picked")
+                    if c.rejected:
+                        tags.append("outlier")
                     if c.label == chosen.label:
                         tags.append("selected")
                     title = c.label + (f" ({', '.join(tags)})" if tags else "")
@@ -242,7 +288,8 @@ with st.container(border=True):
                         c.corr_results, d["min_reliable_n_samples"], title=title, height=260
                     )
                     st.plotly_chart(fig, width="stretch", key=f"sf_grid_plot_{c.label}")
-                    st.caption(f"SNR {c.score:.3g}")
+                    if c.rejected:
+                        st.caption(f"Outlier: {c.reject_reason}")
                     if c.label != chosen.label:
                         # Setting st.session_state[key] for an already-instantiated widget raises --
                         # must be done in an on_click callback, which runs before the rerun, not here.
@@ -273,6 +320,42 @@ with st.container(border=True):
         )
 
     curve_download_labels = {"acf_ch1": "CH1 autocorrelation", "acf_ch2": "CH2 autocorrelation", "cross": "Cross-correlation"}
+
+    if auto.full_trace is not None:
+        st.markdown("**Slow-component plateau** (full trace, G at ~10 ms)")
+        plateau_rows = []
+        for kind, cr in auto.full_trace.corr_results.items():
+            pl = plateau_level(cr, auto.full_trace.corr_errors.get(kind), PLATEAU_TAU_S)
+            if pl is not None:
+                plateau_rows.append(
+                    {"curve": curve_download_labels[kind], "lag used": format_seconds(pl[0]), "G": pl[1], "error": pl[2]}
+                )
+        if plateau_rows:
+            plateau_df = pd.DataFrame(plateau_rows)
+            st.dataframe(plateau_df, hide_index=True, column_config={
+                "G": st.column_config.NumberColumn(format="%.4f"),
+                "error": st.column_config.NumberColumn(format="%.4f"),
+            })
+            st.download_button(
+                "Download plateau levels (CSV)", df_to_csv_bytes(plateau_df.assign(file=uploaded.name)),
+                file_name=f"{uploaded.name}_plateau.csv", key="sf_dl_plateau",
+            )
+            st.caption(
+                "By ~10 ms sub-millisecond diffusion has decayed away, so this is the contribution of "
+                "fluctuations slower than the lag range: large slow species (aggregates) or slow drift. "
+                "A rising cross-correlation plateau means more slow particles carrying both labels. "
+                "It's always taken from the full trace -- short windows each normalize by their own mean, "
+                "which removes most of the slow component. It scales with 1/concentration, so compare "
+                "samples of similar count rate. A common artifact (crosstalk, laser/focus drift) "
+                "raises it too: check single-label and buffer controls. Error is from sub-blocks of the "
+                "trace and is approximate for components this slow."
+            )
+        else:
+            st.caption(
+                "Slow-component plateau: the lag grid stops short of 10 ms. Raise 'Segments' in "
+                "Advanced settings to reach it."
+            )
+
     curve_choice = st.radio(
         "Curve to include in the CSV downloads below",
         options=["All curves"] + [curve_download_labels[k] for k in results],
@@ -305,7 +388,7 @@ with st.container(border=True):
         "Download (VistaVision format)",
         correlation_results_to_vistavision_csv_text(
             results, errors, sampling_rate_hz=1.0 / chosen.eff_dt, mean_rates=chosen.mean_rates,
-            measurement_time_s=chosen.t1 - chosen.t0, raw_data_file=uploaded.name,
+            measurement_time_s=chosen.duration_s, raw_data_file=uploaded.name,
         ),
         file_name=f"{uploaded.name}_correlation_vistavision.csv",
         help="Matches a real VistaVision [HeaderV]/[Data] export's structure (metadata header + one "
@@ -318,10 +401,10 @@ with st.container(border=True):
 with st.container(border=True):
     st.subheader("3. Model fitting (optional)")
     st.caption(
-        "CH1 and CH2 can each be fit from a different candidate window -- pick any window found "
-        "by the search in step 1 independently per channel. Cross-correlation needs both channels "
-        "sampled over the exact same window (it's a paired CH1(t)*CH2(t+tau) product), so it's only "
-        "available when both channels currently use the same one."
+        "CH1 and CH2 can each be fit from a different curve from step 1 (the average, the full "
+        "trace, or a single window). Cross-correlation needs both channels sampled over the exact "
+        "same data (it's a paired CH1(t)*CH2(t+tau) product), so it's only available when both "
+        "channels currently use the same one."
     )
     fit_results = st.session_state.setdefault("sf_fit_results", {})
     fit_window_used = st.session_state.setdefault("sf_fit_window_used", {})
@@ -336,8 +419,8 @@ with st.container(border=True):
             if kind in ("acf_ch1", "acf_ch2"):
                 fit_window_option = st.selectbox(
                     f"Window for {label} fit", options=option_labels, key=f"sf_fit_window_{kind}",
-                    help="Defaults to the window selected in step 1, but you can fit this channel "
-                    "from a different candidate window than the other channel.",
+                    help="Defaults to the curve selected in step 1, but you can fit this channel "
+                    "from a different one than the other channel.",
                 )
                 kind_result = label_lookup[fit_window_option].corr_results[kind]
                 kind_error = label_lookup[fit_window_option].corr_errors.get(kind)
@@ -364,39 +447,69 @@ with st.container(border=True):
                 # result rather than show a fit overlaid on data from a different window.
                 fit_results.pop(kind, None)
 
-            n_components, triplet, n_starts = fit_settings_widgets(f"sf_{kind}", label)
+            fit_opts = fit_settings_widgets(f"sf_{kind}", label)
             if st.button(f"Fit {label}", key=f"sf_fit_btn_{kind}"):
                 # Weight each tau point by 1/sigma_G so the optimizer (and the reported
                 # reduced chi-squared) actually accounts for per-point uncertainty, instead
-                # of treating every point as equally reliable. Points with an unknown/zero
-                # sigma (too few sub-blocks reached that tau) get weight 0 -- excluded from
-                # the fit rather than assigned a made-up uncertainty.
-                if kind_error is not None:
-                    weights = np.where(np.isfinite(kind_error) & (kind_error > 0), 1.0 / kind_error, 0.0)
+                # of treating every point as equally reliable. sigma is smoothed across tau
+                # first so a few points with luckily small sigma don't dominate the fit.
+                # Points with an unknown/zero sigma (too few sub-blocks/windows reached that
+                # tau) get weight 0 -- excluded from the fit rather than assigned a made-up
+                # uncertainty.
+                if kind_error is not None and len(kind_error):
+                    sigma = smooth_error(kind_error)
+                    weights = np.where(np.isfinite(sigma) & (sigma > 0), 1.0 / sigma, 0.0)
                 else:
                     weights = None
-                with st.spinner(f"Fitting {label} ({n_starts} starts)..."):
-                    report = multi_start_fit(
-                        kind_result.tau, kind_result.g, n_components=n_components, triplet=triplet,
-                        n_starts=n_starts, kappa=kappa, weights=weights,
-                    )
-                fit_results[kind] = report
-                fit_window_used[kind] = fit_window_option
+                with st.spinner(f"Fitting {label} ({fit_opts['n_starts']} starts)..."):
+                    try:
+                        report = multi_start_fit(
+                            kind_result.tau, kind_result.g, kappa=kappa, weights=weights, **fit_opts,
+                        )
+                    except ValueError as exc:
+                        report = None
+                        st.error(f"Can't fit: {exc} Lower the 'Fit lags from' cutoff.")
+                if report is not None:
+                    fit_results[kind] = report
+                    fit_window_used[kind] = fit_window_option
             if kind in fit_results:
                 report = fit_results[kind]
                 fr = report.chosen_result
-                badge = "STABLE" if report.is_stable else "UNSTABLE -- fit is sensitive to starting guess"
-                (st.success if report.is_stable else st.error)(
-                    f"{badge} ({report.converged_fraction:.0%} of {n_starts} starts converged)"
-                )
+                verdict_box = {QUALITY_GOOD: st.success, QUALITY_ROUGH: st.warning}.get(fr.quality, st.error)
+                verdict = f"tau_D {fr.quality}"
+                if fr.quality_reasons:
+                    verdict += ": " + "; ".join(fr.quality_reasons)
+                verdict_box(verdict)
                 st.plotly_chart(
-                    plot_fit_overlay(kind_result.tau, kind_result.g, fr.fit_curve, title=label, color=SERIES_COLORS.get(kind)),
+                    plot_fit_overlay(
+                        kind_result.tau, kind_result.g, fr.fit_curve, title=label, color=SERIES_COLORS.get(kind),
+                        err=kind_error, fit_tau_min=fr.fit_tau_min, fit_tau_max=fr.fit_tau_max,
+                    ),
                     width="stretch",
                 )
-                for i, td in enumerate(fr.tauD):
-                    st.metric(f"tau_D{'' if len(fr.tauD) == 1 else f' ({i + 1})'}", format_seconds(td))
+                for i, (td, rel) in enumerate(zip(fr.tauD, fr.tauD_rel_err)):
+                    name = f"tau_D{'' if len(fr.tauD) == 1 else f' ({i + 1})'}"
+                    if i == 0 and fr.fixed_tauD1 is not None:
+                        st.metric(name, f"{format_seconds(td)} (fixed)")
+                    else:
+                        st.metric(
+                            name,
+                            f"{format_seconds(td)} ± {format_rel_err(rel)}" if np.isfinite(rel) else f"{format_seconds(td)} ± ?",
+                        )
+                if fr.n_components == 2 and "f1" in fr.params:
+                    f1, f1_se = fr.params["f1"], fr.params_stderr.get("f1", float("nan"))
+                    st.metric(
+                        "Fast-component fraction f1",
+                        f"{f1:.2f} ± {f1_se:.2f}" if np.isfinite(f1_se) else f"{f1:.2f} ± ?",
+                    )
                 st.metric("N (amplitude)", f"{fr.N:.3g}")
-                st.caption(f"Reduced chi-squared = {fr.redchi:.4g}")
+                st.caption(
+                    f"Fitted {fr.n_points_fit} lags from {format_seconds(fr.fit_tau_min)} to "
+                    f"{format_seconds(fr.fit_tau_max)}. Baseline G∞ = {fr.G_inf:.3g}. "
+                    f"Reduced chi-squared = {fr.redchi:.4g}. Starting-guess check: "
+                    + ("consistent" if report.is_stable else "inconsistent")
+                    + f" ({report.converged_fraction:.0%} of {len(report.per_start_results)} starts converged)."
+                )
                 with st.expander("Per-start results (stability check)"):
                     st.dataframe(stability_report_to_df(report, label=label))
                 st.download_button(
@@ -419,6 +532,21 @@ if "acf_ch1" in fit_results and "acf_ch2" in fit_results and "cross" in fit_resu
         bcols = st.columns(2)
         bcols[0].metric("Bound fraction of CH2 species", f"{bound_ch2_species:.3f}")
         bcols[1].metric("Bound fraction of CH1 species", f"{bound_ch1_species:.3f}")
+        undetermined = [
+            curve_download_labels[k] for k in ("acf_ch1", "acf_ch2", "cross")
+            if fit_results[k].chosen_result.quality == QUALITY_UNRESOLVED
+        ]
+        if undetermined:
+            st.error(
+                "Not meaningful: the fit for " + ", ".join(undetermined) + " is not determined, so "
+                "its amplitude (and these ratios) are not reliable."
+            )
+        out_of_range = [v for v in (bound_ch2_species, bound_ch1_species) if np.isfinite(v) and not 0 <= v <= 1]
+        if out_of_range:
+            st.warning(
+                "A bound fraction outside 0-1 is physically impossible. It points to noisy "
+                "amplitudes, spectral crosstalk, or unequal detection volumes in the two channels."
+            )
         st.caption("No spectral crosstalk correction applied (uncorrected amplitude-ratio formula).")
         st.download_button(
             "Download FCCS bound fractions (CSV)",

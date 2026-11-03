@@ -123,6 +123,16 @@ def fit_result_to_df(fit_result, label=""):
                 "stderr": fit_result.params_stderr.get(name, float("nan")),
             }
         )
+    summary = {
+        "quality": fit_result.quality,
+        "quality_reasons": "; ".join(fit_result.quality_reasons),
+        "fit_tau_min_s": fit_result.fit_tau_min,
+        "fit_tau_max_s": fit_result.fit_tau_max,
+        "n_points_fit": fit_result.n_points_fit,
+        "redchi": fit_result.redchi,
+    }
+    for name, value in summary.items():
+        rows.append({"label": label, "parameter": name, "value": value, "stderr": float("nan")})
     df = pd.DataFrame(rows)
     df.attrs["n_components"] = fit_result.n_components
     df.attrs["redchi"] = fit_result.redchi

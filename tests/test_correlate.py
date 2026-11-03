@@ -119,3 +119,21 @@ def test_compute_correlation_error_too_few_blocks_gives_nan(rng):
     # Long-tau points that only the full-length trace (not any 1/3-length sub-block) can
     # reach will have fewer than 2 contributing sub-blocks -> NaN, not a fabricated number.
     assert np.any(np.isnan(errors["acf_ch1"]))
+
+
+def test_plateau_level_reads_slow_component_at_10ms():
+    from core.correlate import CorrelationResult, plateau_level
+    from core.models import fcs_1comp
+
+    tau = np.logspace(-5, -1, 60)
+    g = fcs_1comp(tau, 100.0, 3e-4) + 0.02  # fast diffusion + slow plateau
+    err = np.full_like(tau, 5e-4)
+    res = CorrelationResult(tau, g, np.ones_like(tau), "acf_ch1", 1e-5, 5, 15, 4)
+
+    tau_used, level, sigma = plateau_level(res, err)
+    assert np.isclose(tau_used, 1e-2, rtol=0.1)
+    assert np.isclose(level, 0.02, atol=0.0015)  # diffusion has decayed to <10% by 10 ms
+    assert sigma == 5e-4
+
+    short = CorrelationResult(tau[tau < 3e-3], g[tau < 3e-3], np.ones(np.sum(tau < 3e-3)), "acf_ch1", 1e-5, 5, 15, 4)
+    assert plateau_level(short, err) is None

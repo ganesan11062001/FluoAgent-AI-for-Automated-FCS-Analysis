@@ -34,10 +34,12 @@ def bound_fraction_from_cross(g_cross0, g_partner0):
 
 
 def amplitude_at_zero(fit_result):
-    """Evaluate a FitResult's fitted model amplitude at tau->0. Every diffusion_i(tau)
-    term equals 1 at tau=0 and the component fractions f_i sum to 1, so this reduces
-    to 1/N regardless of component count -- used instead of the noisiest raw
-    near-zero-lag data point."""
+    """The fitted diffusion amplitude at tau->0. Every diffusion_i(tau) term equals 1
+    at tau=0 and the component fractions f_i sum to 1, so this reduces to 1/N
+    regardless of component count -- used instead of the noisiest raw near-zero-lag
+    data point. The baseline offset G_inf is deliberately excluded: it comes from
+    fluctuations much slower than diffusion, not from the diffusing complexes the
+    bound-fraction ratio is about."""
     if fit_result is None or not fit_result.success:
         return float("nan")
     return 1.0 / fit_result.N

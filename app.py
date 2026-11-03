@@ -25,7 +25,7 @@ def home():
         ),
         (
             "Single File Analysis",
-            "Load one trace, trim the time window, run the multi-tau correlation engine, and "
+            "Load one trace, average its non-outlier time windows, run the multi-tau correlation engine, and "
             "fit diffusion models to get diffusion time and (for dual-channel data) the FCCS "
             "bound fraction.",
         ),
@@ -44,8 +44,10 @@ def home():
         st.markdown(
             """
 1. **Load** — your CSV's time column + 1 or 2 intensity columns are read in.
-2. **Trim the time window** — cut out any bad stretch of the acquisition (laser drift,
-   focus loss); the kept region is shaded on the raw trace plot.
+2. **Split into windows and screen them** — the trace is split into windows of a length
+   you pick; windows with an outlying count rate or amplitude (bleaching, drift, focus
+   loss, aggregates) are rejected and the rest are averaged. Kept and rejected windows are
+   shaded on the raw trace plot.
 3. **Bin points** *(optional)* — group N consecutive raw samples together before
    correlating, to reduce shot noise. Leave at 1 to skip this.
 4. **Run the multi-tau correlation** — computes G(τ) for each channel (and the

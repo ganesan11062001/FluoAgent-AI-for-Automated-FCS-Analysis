@@ -14,7 +14,7 @@ import streamlit as st
 
 from core.io import load_trace_auto
 from core.engine import _coarsen, select_window
-from core.autowindow import search_best_window
+from core.autowindow import analyze_windows
 
 DEFAULT_SETTINGS = {
     "segments": 5,
@@ -114,14 +114,14 @@ def load_trace_cached(file_bytes, filename):
         os.unlink(tmp_path)
 
 
-@st.cache_resource(show_spinner="Sliding the window across the trace to find the cleanest stretch...")
+@st.cache_resource(show_spinner="Correlating every window and screening out outliers...")
 def run_auto_window_search_cached(
     file_bytes, filename, window_length_s, segments, points_per_segment, base, bin_points, n_blocks
 ):
     """Cached so re-running the page (e.g. clicking a fit button) doesn't redo the
-    sliding-window search -- only a change to the file or a settings value does."""
+    window analysis -- only a change to the file or a settings value does."""
     trace = load_trace_cached(file_bytes, filename)
-    return search_best_window(
+    return analyze_windows(
         trace.time, trace.channels, window_length_s=window_length_s,
         segments=segments, points_per_segment=points_per_segment, base=base,
         bin_points=bin_points, n_blocks=n_blocks,
@@ -183,7 +183,10 @@ def time_window_selector(time_arr, key_prefix):
     return t0, t1
 
 
-def plot_raw_trace_with_window(time_arr, channels, t0, t1, max_points=5000):
+def plot_raw_trace_with_window(time_arr, channels, t0, t1, max_points=5000, kept_spans=None, rejected_spans=None):
+    """Raw trace with the analyzed region shaded. kept_spans/rejected_spans
+    (lists of (t0, t1)) override the single [t0, t1] span, e.g. to show which
+    windows went into an average and which were screened out."""
     disp_time, _ = decimate_for_display(time_arr, next(iter(channels.values())), max_points)
     fig = go.Figure()
     channel_colors = {"CH1": SERIES_COLORS["acf_ch1"], "CH2": SERIES_COLORS["acf_ch2"]}
@@ -195,7 +198,12 @@ def plot_raw_trace_with_window(time_arr, channels, t0, t1, max_points=5000):
                 line=dict(width=2, color=channel_colors.get(name)),
             )
         )
-    fig.add_vrect(x0=t0, x1=t1, fillcolor="#2a78d6", opacity=0.08, line_width=0, annotation_text="kept window")
+    if kept_spans is None and rejected_spans is None:
+        fig.add_vrect(x0=t0, x1=t1, fillcolor="#2a78d6", opacity=0.08, line_width=0, annotation_text="kept window")
+    for k0, k1 in kept_spans or []:
+        fig.add_vrect(x0=k0, x1=k1, fillcolor="#2a78d6", opacity=0.08, line_width=0)
+    for r0, r1 in rejected_spans or []:
+        fig.add_vrect(x0=r0, x1=r1, fillcolor="#d62a2a", opacity=0.15, line_width=0, annotation_text="rejected")
     fig.update_layout(
         xaxis_title="Time (s)",
         yaxis_title="Photon counts / bin",
@@ -249,12 +257,26 @@ def plot_correlation_curve(results, min_reliable_n_samples, title="", height=400
     return apply_chart_style(fig), any_unreliable
 
 
-def plot_fit_overlay(tau, g, fit_curve_arr, title="", color=None):
+def plot_fit_overlay(tau, g, fit_curve_arr, title="", color=None, err=None, fit_tau_min=None, fit_tau_max=None):
+    """Data (with error bars if err is given) and fitted curve. Lags outside
+    [fit_tau_min, fit_tau_max] are shaded grey: shown, but not used by the fit."""
     color = color or SERIES_COLORS["acf_ch1"]
     fig = go.Figure()
+    error_y = None
+    if err is not None and len(err):
+        error_y = dict(type="data", array=np.where(np.isfinite(err), err, 0), thickness=1, width=0, color=MUTED_INK)
     fig.add_trace(
-        go.Scatter(x=tau, y=g, mode="markers", name="data", marker=dict(size=8, color=MUTED_INK, opacity=0.7))
+        go.Scatter(
+            x=tau, y=g, mode="markers", name="data", error_y=error_y,
+            marker=dict(size=8, color=MUTED_INK, opacity=0.7),
+        )
     )
+    tau_pos = tau[tau > 0]
+    if fit_tau_min is not None and len(tau_pos) and tau_pos.min() < fit_tau_min:
+        fig.add_vrect(x0=tau_pos.min(), x1=fit_tau_min, fillcolor="#888888", opacity=0.12, line_width=0,
+                      annotation_text="not fitted", annotation_position="top left")
+    if fit_tau_max is not None and len(tau_pos) and tau_pos.max() > fit_tau_max:
+        fig.add_vrect(x0=fit_tau_max, x1=tau_pos.max(), fillcolor="#888888", opacity=0.12, line_width=0)
     order = np.argsort(tau)
     fig.add_trace(
         go.Scatter(x=tau[order], y=fit_curve_arr[order], mode="lines", name="fit", line=dict(color=color, width=2))
@@ -281,7 +303,7 @@ def fit_settings_widgets(key_prefix, label):
             "fits two independent tau_D's plus their amplitude split (f1/f2) -- use this if "
             "the curve visibly has a fast and a slow decay (e.g. free monomer + aggregate). "
             "More parameters also means more risk of an unstable/degenerate fit -- check the "
-            "stability badge after fitting."
+            "fit quality verdict after fitting."
         ),
     )
     triplet = st.checkbox(
@@ -309,4 +331,45 @@ def fit_settings_widgets(key_prefix, label):
             "2-component fits, which are more prone to degenerate solutions than 1-component."
         ),
     )
-    return n_components, triplet, n_starts
+    offset = st.checkbox(
+        "Fit a baseline offset G∞", value=True, key=f"{key_prefix}_offset",
+        help=(
+            "Adds a constant to the model.\n\n"
+            r"Formula: $G(\tau) = G_\infty + \frac{1}{N}\sum_i f_i D_i(\tau)$"
+            "\n\n"
+            "Impact: absorbs fluctuations much slower than diffusion (aggregates, drift), "
+            "which look like a flat plateau across the lag range. Without it the fit can only "
+            "explain that plateau by stretching tau_D, often to seconds. Leave on unless the "
+            "curve clearly decays to zero within the lag range."
+        ),
+    )
+    tau_min_us = st.number_input(
+        "Fit lags from (µs)", min_value=0.0, value=20.0, step=5.0, key=f"{key_prefix}_tau_min_us",
+        help=(
+            "Lags shorter than this are shown but left out of the fit.\n\n"
+            "Impact: the earliest autocorrelation lags carry detector artifacts "
+            "(afterpulsing, dead time) that add a spurious fast spike. 10-20 µs is a common "
+            "cutoff. Cross-correlations between two detectors don't have this artifact."
+        ),
+    )
+    fixed_tauD1 = None
+    if n_components == 2:
+        fix = st.checkbox(
+            "Fix τ_D1 (fast component) at a known value", key=f"{key_prefix}_fix_tauD1",
+            help=(
+                "Holds the faster component's diffusion time at a value you enter, e.g. the "
+                "monomer tau_D from a control sample, and fits only the slower component and "
+                "the split between them.\n\n"
+                "Impact: on noisy curves a free 2-component fit can trade the two components "
+                "off against each other almost arbitrarily. Fixing one removes most of that. "
+                "Only as good as the control: use a value that was itself well determined."
+            ),
+        )
+        if fix:
+            fixed_tauD1 = st.number_input(
+                "τ_D1 (µs)", min_value=0.1, value=300.0, step=10.0, key=f"{key_prefix}_fixed_tauD1_us",
+            ) * 1e-6
+    return dict(
+        n_components=n_components, triplet=triplet, n_starts=n_starts, offset=offset,
+        tau_min=tau_min_us * 1e-6, fixed_tauD1=fixed_tauD1,
+    )

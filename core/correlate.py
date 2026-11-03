@@ -90,3 +90,53 @@ def compute_correlation_error(full_results, channels, dt, segments=5, points_per
                 err[i] = np.std(vals, ddof=1) / np.sqrt(len(vals))
         errors[kind] = err
     return errors
+
+
+def smooth_error(err, width=5):
+    """Running median of sigma_G across neighbouring tau points, for fit weights only.
+
+    Each sigma is itself estimated from a handful of sub-blocks or windows, so it
+    scatters by tens of percent point to point. Weighting a fit by 1/sigma
+    directly lets a few points with luckily small sigma dominate. The true
+    uncertainty varies smoothly with tau, so a short running median keeps its
+    shape and removes most of that scatter. NaN entries stay NaN and are left out
+    of their neighbours' medians.
+    """
+    err = np.asarray(err, dtype=np.float64)
+    out = np.full_like(err, np.nan)
+    half = width // 2
+    for i in range(len(err)):
+        if not np.isfinite(err[i]):
+            continue
+        neighbours = err[max(0, i - half): i + half + 1]
+        neighbours = neighbours[np.isfinite(neighbours)]
+        out[i] = np.median(neighbours)
+    return out
+
+
+PLATEAU_TAU_S = 1e-2
+
+
+def plateau_level(result, err, target_tau=PLATEAU_TAU_S):
+    """G and its error at the lag nearest target_tau (default 10 ms) -- the level of
+    the slow-component plateau, a readout of large slow species (aggregates) or slow
+    drift.
+
+    At ~10 ms, sub-millisecond diffusion has decayed away, so what's left is the
+    contribution of fluctuations slower than the lag range. On real traces this is
+    far better measured than tau_D (errors ~0.0003 vs. a plateau of 0.003-0.03).
+
+    Use it on a FULL-TRACE curve: short windows each normalize by their own mean,
+    which removes most of the slow component, so a windowed average reads ~0 here
+    by construction. The amplitude also scales with 1/concentration, so compare it
+    across samples of similar concentration (or alongside their count rates).
+
+    Returns (tau_used, g, sigma), or None if the lag grid stops short of
+    target_tau / 2 (raise the segment count to reach it).
+    """
+    tau = np.asarray(result.tau)
+    if not len(tau) or tau.max() < target_tau / 2:
+        return None
+    i = int(np.argmin(np.abs(np.log(tau / target_tau))))
+    sigma = float(err[i]) if err is not None and len(err) > i else float("nan")
+    return float(tau[i]), float(result.g[i]), sigma

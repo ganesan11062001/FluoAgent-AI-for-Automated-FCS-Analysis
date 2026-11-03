@@ -47,6 +47,38 @@ def test_single_file_analysis_dual_channel_end_to_end():
         assert not at.exception, f"exception after clicking {key}: {at.exception}"
 
 
+def test_single_file_analysis_averages_windows_by_default():
+    """A trace long enough for several 3 s windows: the default curve must be the
+    average, and fitting it plus the FCCS step must run cleanly."""
+    at = AppTest.from_file("pages/1_Single_File_Analysis.py")
+    at.run(timeout=60)
+    at.file_uploader[0].set_value(("long.csv", _make_dual_channel_csv_bytes(n=12000, dt=1e-3), "text/csv"))
+    at.run(timeout=120)
+    assert not at.exception
+
+    assert at.selectbox(key="sf_window_choice").value.startswith("Average of")
+    for key in ["sf_fit_btn_acf_ch1", "sf_fit_btn_acf_ch2", "sf_fit_btn_cross"]:
+        at.button(key=key).click()
+        at.run(timeout=120)
+        assert not at.exception, f"exception after clicking {key}: {at.exception}"
+
+
+def test_two_component_fit_with_fixed_tauD1_runs():
+    at = AppTest.from_file("pages/1_Single_File_Analysis.py")
+    at.run(timeout=60)
+    at.file_uploader[0].set_value(("long.csv", _make_dual_channel_csv_bytes(n=12000, dt=1e-3), "text/csv"))
+    at.run(timeout=120)
+    at.radio(key="sf_acf_ch1_ncomp").set_value(2)
+    at.run(timeout=60)
+    at.checkbox(key="sf_acf_ch1_fix_tauD1").check()
+    at.run(timeout=60)
+    at.number_input(key="sf_acf_ch1_tau_min_us").set_value(0.0)  # 1 ms sampling: keep every lag
+    at.button(key="sf_fit_btn_acf_ch1").click()
+    at.run(timeout=120)
+    assert not at.exception
+    assert any("(fixed)" in str(m.value) for m in at.metric)
+
+
 def test_single_file_analysis_single_channel_end_to_end():
     at = AppTest.from_file("pages/1_Single_File_Analysis.py")
     at.run(timeout=60)

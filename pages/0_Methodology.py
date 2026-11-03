@@ -17,8 +17,7 @@ with st.container(border=True):
     st.markdown(
         """
 1. **Load** — parse the CSV's time column + 1 or 2 intensity columns.
-2. **Auto-select the time window** — evaluate a few candidate windows and keep the
-   cleanest one, no manual trimming needed.
+2. **Split into windows, reject outliers, average** — no manual trimming needed.
 3. **Bin** *(optional)* — group N raw points together before correlating.
 4. **Correlate** — compute the autocorrelation of each channel, and (if 2 channels) the
    symmetrized cross-correlation, on a multi-tau lag grid.
@@ -42,27 +41,36 @@ with st.container(border=True):
     st.latex(r"G_\times(\tau) = \tfrac{1}{2}\left[G_{1\to2}(\tau) + G_{2\to1}(\tau)\right]")
 
 with st.container(border=True):
-    st.subheader("2. Automatic time-window selection")
+    st.subheader("2. Time windows: screening and averaging")
     st.markdown(
-        "Instead of asking you to eyeball and drag a time-window trim, you pick a **window "
-        "length** L (a dropdown, e.g. 3 s), and the app slides a window of that length across "
-        "the whole acquisition in fixed 1-second steps:"
+        "You pick a **window length** L (a dropdown, e.g. 3 s). The trace is split into "
+        "non-overlapping windows of that length, and each is correlated separately:"
     )
-    st.latex(r"[0, L),\ [1, 1{+}L),\ [2, 2{+}L),\ \dots\ \text{up to the end of the trace}")
+    st.latex(r"[0, L),\ [L, 2L),\ [2L, 3L),\ \dots\ \text{up to the end of the trace}")
     st.markdown(
-        "Every one of those candidate windows is correlated, and the app keeps whichever "
-        "produces the cleanest correlation curve. Because every candidate is the same length, "
-        "the comparison is apples-to-apples. Cleanliness is scored as the median "
-        "signal-to-noise ratio across tau, using the sub-block error estimate from step 4:"
+        "Each window gets a robust z-score for its mean count rate in each channel and for "
+        "its correlation amplitude in each curve. The amplitude is the mean G over the first "
+        "5 lags, roughly 1/N:"
     )
-    st.latex(r"\text{SNR} = \operatorname{median}_\tau \frac{|G(\tau)|}{\sigma_{G(\tau)}}")
+    st.latex(
+        r"z = \frac{|x - \operatorname{median}(x)|}{1.4826 \cdot \operatorname{MAD}(x)}, "
+        r"\qquad \text{reject if } z > 3.5 \text{ for any metric}"
+    )
     st.markdown(
-        "For a dual-channel trace, the score is averaged across CH1, CH2, and the "
-        "cross-correlation. A candidate window is skipped if it's too short to split into "
-        "the configured number of sub-blocks. This is a fixed grid search over one window "
-        "length at a time, not an exhaustive scan over all possible lengths -- it targets "
-        "finding the cleanest stretch of a given duration, not solving arbitrary "
-        "trace-quality problems."
+        "Count-rate outliers catch bleaching, drift, and focus loss. Amplitude outliers catch "
+        "bright aggregates passing through the volume. Median and MAD are used instead of "
+        "mean and standard deviation so the outliers themselves can't hide by inflating the "
+        "spread. Screening needs at least 3 windows. The accepted windows' curves are then "
+        "averaged point by point:"
+    )
+    st.latex(r"\bar G(\tau) = \frac{1}{M}\sum_{m=1}^{M} G_m(\tau)")
+    st.markdown(
+        "This averaged curve is the default. The app deliberately does **not** pick the "
+        "single \"cleanest\" window. Ranking windows by signal-to-noise favors those with a "
+        "larger G, i.e. fewer molecules or an aggregate, and taking the best of many biases "
+        "every result toward whichever stretch happened to look best. Overlapping windows in "
+        "1 s steps are also computed, and the full trace as one curve, so you can inspect or "
+        "pick any of these by hand. If fewer than 2 windows survive, the full trace is used."
     )
 
 with st.container(border=True):
@@ -81,13 +89,24 @@ with st.container(border=True):
     )
 
 with st.container(border=True):
-    st.subheader("4. Per-point error (optional)")
+    st.subheader("4. Per-point error")
     st.markdown(
-        "The trace is split into **N contiguous sub-blocks**; each is independently run "
-        "through steps 1–2 with identical settings. The uncertainty at each τ is the "
-        "standard error of G(τ) across sub-blocks:"
+        "For the **averaged curve**, the uncertainty at each τ is the standard error across "
+        "the M accepted windows. They don't overlap, so they're independent:"
     )
-    st.latex(r"\sigma_{G(\tau)} = \frac{\text{std}\left(\{G_b(\tau)\}_{b=1}^{N}\right)}{\sqrt{N}}")
+    st.latex(r"\sigma_{G(\tau)} = \frac{\text{std}\left(\{G_m(\tau)\}_{m=1}^{M}\right)}{\sqrt{M}}")
+    st.markdown(
+        "For a **single window or the full trace**, the same formula is applied across N "
+        "contiguous sub-blocks of it (the \"Sub-blocks\" setting), each correlated with "
+        "identical settings."
+    )
+    st.markdown(
+        "**Fit weights.** With only 5–20 blocks, each σ is itself uncertain by tens of "
+        "percent. Weighting by 1/σ directly would let a few points with luckily small σ "
+        "dominate the fit. So before fitting, σ is smoothed with a running median over 5 "
+        "neighbouring τ points. The true uncertainty varies smoothly with τ, so this keeps its "
+        "shape. Exported error bars are left unsmoothed."
+    )
     st.caption(
         "A standard block-averaging convention used broadly across FCS correlator software "
         "— not a reproduction of any one instrument's internal error algorithm."
@@ -111,6 +130,31 @@ with st.container(border=True):
     )
     st.markdown("An optional fast blinking/triplet-state prefactor can be multiplied in:")
     st.latex(r"G(\tau) \;\leftarrow\; G(\tau)\cdot \frac{1-T+T\,e^{-\tau/\tau_{trip}}}{1-T}")
+    st.markdown("A constant **baseline offset** is added on top (on by default):")
+    st.latex(r"G(\tau) \;\leftarrow\; G_\infty + G(\tau)")
+    st.markdown(
+        r"Fluctuations much slower than diffusion (aggregates, drift) look like a flat plateau "
+        r"across the lag range. Without $G_\infty$ the fit can only explain that plateau by "
+        r"stretching $\tau_D$, often to seconds. $G_\infty$ is left out of $1/N$ and out of the "
+        r"FCCS amplitudes."
+    )
+    st.markdown(
+        r"**Fit range.** Only lags from a cutoff (default 20 µs) up to the last lag are fitted. "
+        r"The earliest autocorrelation lags carry detector artifacts (afterpulsing, dead time). "
+        r"$\tau_D$ is bounded to the fitted lag range."
+    )
+    st.markdown(
+        r"**Quality verdict.** Each fit reports $\tau_D \pm$ its standard error and a verdict:"
+    )
+    st.markdown(
+        """
+- **well determined** — relative error ≤ 25%, and different starting guesses agree.
+- **rough** — relative error 25–100%, or starting guesses disagree.
+- **not determined** — any of: relative error > 100% or not estimable; τ_D within a
+  factor 2 of either end of the fitted lag range (the decay isn't sampled on both sides);
+  amplitude 1/N not distinguishable from zero.
+        """
+    )
 
 with st.container(border=True):
     st.subheader("6. FCCS bound fraction")
